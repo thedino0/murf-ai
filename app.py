@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render-ready web frontend for the keyless Murf client.
+"""Web frontend for the keyless Murf client.
 
 The browser UI posts a small JSON document to /api/synthesize. The server
 resolves the voice, chunks long text with murf.split_text, writes the joined
@@ -10,7 +10,8 @@ Run locally:
     python app.py
     # http://127.0.0.1:10000
 
-Render sets PORT and expects the process to bind 0.0.0.0.
+Vercel serves public/ as static files and api/ as Python functions. The same
+Application class powers both deployments.
 """
 
 from __future__ import annotations
@@ -35,7 +36,8 @@ from typing import Any, Mapping
 import murf
 
 ROOT = Path(__file__).resolve().parent
-WEB_ROOT = ROOT / "web"
+WEB_ROOT = ROOT / "public"
+STATIC_ROOT = WEB_ROOT / "static"
 APP_NAME = "murf-web"
 VERSION = "1.0.0"
 DEFAULT_PORT = 10000
@@ -199,10 +201,11 @@ class Application:
         )
         base_url = os.environ.get("MURF_BASE_URL", murf.DEFAULT_BASE_URL)
         self.client = client or murf.MurfClient(base_url=base_url, retry=retry)
+        default_max_text = 2500 if os.environ.get("VERCEL") else 5000
         self.max_text = int(
             max_text
             if max_text is not None
-            else _env_int("WEB_MAX_TEXT", 5000, murf.MAX_CHUNK_CHARS, 50000)
+            else _env_int("WEB_MAX_TEXT", default_max_text, murf.MAX_CHUNK_CHARS, 50000)
         )
         self.chunk_delay = float(
             chunk_delay
@@ -463,9 +466,9 @@ class Handler(BaseHTTPRequestHandler):
         relative = urllib.parse.unquote(request_path[len("/static/") :])
         if not relative or ".." in Path(relative).parts:
             return None
-        candidate = (WEB_ROOT / relative).resolve()
+        candidate = (STATIC_ROOT / relative).resolve()
         try:
-            candidate.relative_to(WEB_ROOT.resolve())
+            candidate.relative_to(STATIC_ROOT.resolve())
         except ValueError:
             return None
         if not candidate.is_file():
@@ -477,7 +480,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
 
         try:
-            if path == "/healthz":
+            if path in ("/healthz", "/api/healthz"):
                 self._send_json(
                     HTTPStatus.OK,
                     {"ok": True, "service": APP_NAME, "version": VERSION},
@@ -549,7 +552,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path == "/healthz":
+        if parsed.path in ("/healthz", "/api/healthz"):
             body = json.dumps(
                 {"ok": True, "service": APP_NAME, "version": VERSION},
                 separators=(",", ":"),
@@ -691,7 +694,7 @@ def make_server(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Render-ready keyless Murf web app")
+    parser = argparse.ArgumentParser(description="Keyless Murf web app")
     parser.add_argument(
         "--host",
         default=os.environ.get("HOST", "0.0.0.0"),

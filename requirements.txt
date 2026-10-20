@@ -1,2 +1,2 @@
 # The web app and both clients use only the Python standard library.
-# This file exists so Render detects the project as a Python service.
+# Vercel reads this file to select the Python runtime; it installs no packages.

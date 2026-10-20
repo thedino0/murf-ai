@@ -1,4 +1,4 @@
-"""End-to-end checks for the Render web app.
+"""End-to-end checks for the local web app.
 
 Run from the repository root:
 
@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT))
 
 import app  # noqa: E402
 import murf  # noqa: E402
+import server.vercel_core as vercel_core  # noqa: E402
 from tests.test_free_client import AUDIO, Handler  # noqa: E402
 
 
@@ -156,6 +157,49 @@ def main():
         assert limiter.reserve("visitor", 1) is None
         assert limiter.reserve("visitor", 1) >= 1
         assert limiter.reserve("other", 1) is None
+
+        # Exercise the Vercel adapter with the same mock client. Vercel
+        # normally calls /api/*, but the adapter also accepts /healthz.
+        vercel_core.application = app.Application(
+            client=client,
+            max_text=5000,
+            rate_units=0,
+            max_concurrent=1,
+            chunk_delay=0,
+        )
+        route = object.__new__(vercel_core.ApiHandler)
+        route.path = "/voices?limit=1"
+        assert route._normalized_path() == "/api/voices?limit=1"
+        route.path = "/api/healthz/"
+        assert route._normalized_path() == "/api/healthz"
+
+        vercel_web = ThreadingHTTPServer(("127.0.0.1", 0), vercel_core.ApiHandler)
+        threading.Thread(target=vercel_web.serve_forever, daemon=True).start()
+        vbase = f"http://127.0.0.1:{vercel_web.server_port}"
+        try:
+            status, headers, body = call(vbase, "/api/config")
+            assert status == 200
+            assert decode(body)["maxChars"] == 5000
+
+            status, headers, body = call(vbase, "/healthz")
+            assert status == 200
+            assert decode(body)["ok"] is True
+
+            status, headers, body = call(vbase, "/api/voices")
+            assert status == 200
+            assert decode(body)["count"] == 3
+
+            status, headers, body = call(
+                vbase,
+                "/api/synthesize",
+                {"text": "hello from vercel", "voice": "en-US-test"},
+            )
+            assert status == 200, body
+            assert body == AUDIO
+            assert headers["Content-Type"] == "audio/mpeg"
+        finally:
+            vercel_web.shutdown()
+            vercel_web.server_close()
 
         print("all web checks passed")
         return 0
