@@ -755,15 +755,15 @@ def _add_audio_options(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="murf.py",
-        description="Murf.ai text-to-speech client",
+        prog="murf_api.py",
+        description="Murf.ai official API text-to-speech client",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  python murf.py voices --locale en-US --gender female\n"
-            "  python murf.py speak \"Hello there.\" --voice en-US-natalie -o hi.mp3\n"
-            "  python murf.py speak --file script.txt --voice en-US-natalie --format WAV\n"
-            "  python murf.py batch lines.txt --voice en-US-natalie -o out --prefix clip\n"
+            "  python murf_api.py voices --locale en-US --gender female\n"
+            "  python murf_api.py speak \"Hello there.\" --voice en-US-natalie -o hi.mp3\n"
+            "  python murf_api.py speak --file script.txt --voice en-US-natalie --format WAV\n"
+            "  python murf_api.py batch lines.txt --voice en-US-natalie -o out --prefix clip\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
