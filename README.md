@@ -105,6 +105,56 @@ calls` with no `Retry-After` header. The client raises `MurfLimitError` and a
 batch stops instead of retrying an exhausted budget. Wait for the window to
 reset or use the keyed client for guaranteed quota.
 
+## Official API client
+
+Use `murf_api.py` when the keyless endpoint's MP3 output or per-IP budget is
+not enough. It reads `MURF_API_KEY` from the environment; `--api-key` is also
+accepted for one-off runs.
+
+```powershell
+$env:MURF_API_KEY = "..."
+py -3 murf_api.py voices --limit 10
+py -3 murf_api.py speak "Hello." --voice en-US-natalie `
+  -o hello.wav --format WAV --sample-rate 44100
+py -3 murf_api.py speak "Stream this." --voice en-US-natalie `
+  --stream -o stream.mp3
+py -3 murf_api.py batch lines.txt -o out --prefix clip --fail-fast
+```
+
+The official client supports MP3, WAV, FLAC, ALAW, and ULAW; 8, 16, 24, 44.1,
+and 48 kHz; mono or stereo; streaming and optional base64 responses;
+`--variation`; and `--multi-native-locale`. Account quotas apply. Use
+`--region` or `--base-url` only when Murf gives you a regional host.
+
+Keep the key in the environment, not in a tracked file.
+
+## Tests
+
+```powershell
+py -3 tests/test_free_client.py
+```
+
+The test starts a local HTTP server and exercises retries, catalog caching,
+free and premium lookup, rate/pitch/locale forwarding, limit handling, and
+chunk sizing. It does not call Murf and does not need a key.
+
+## How it works
+
+`murf.py` makes plain GET requests to two public endpoints:
+
+- `/Prod/ping/common-voices` returns the same catalog used by the widget.
+- `/Prod/anonymous-tts/audio` returns MP3 bytes for one text segment.
+
+Requests are retried on 408, 425, 429, and transient 5xx responses. A 502
+with a JSON `message` is treated as an application error and is not retried.
+Responses must start with an MP3 frame or ID3 header; HTML error pages are
+rejected instead of saved as audio.
+
+The anonymous endpoint is not a documented API. It can change without notice,
+and the premium catalog entries are not guaranteed to remain available. The
+client keeps the endpoint paths and request fields in one place so they are
+easy to update.
+
 ## Supported and not supported
 
 | Capability | Keyless `murf.py` |
@@ -128,4 +178,14 @@ reset or use the keyed client for guaranteed quota.
 Unknown parameters are not necessarily rejected. The server may silently drop
 them, so the table reflects what was tested rather than what a flag name
 suggests.
+
+## Troubleshooting
+
+| Error or symptom | What to do |
+| --- | --- |
+| `Exceeded limit of calls` | Wait for the per-IP window to reset, or switch to `murf_api.py` |
+| `Invalid text provided` | Shorten the request; the server rejected it as over the limit |
+| `Voice Not Found` | The premium id is no longer accepted; pick another voice |
+| `endpoint returned a non-audio response` | The endpoint served HTML or JSON instead of MP3; retry later |
+| Empty output directory | Check the batch input has non-empty lines and `-o` points to a writable path |
 
