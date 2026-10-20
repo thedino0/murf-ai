@@ -4,7 +4,7 @@
   const FALLBACK_CONFIG = {
     version: "1.0.0",
     clientVersion: "2.1.0",
-    maxChars: 5000,
+    maxChars: 2500,
     maxChunk: 500,
     adjustmentMin: -50,
     adjustmentMax: 50,
