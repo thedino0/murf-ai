@@ -5,7 +5,7 @@ Python clients and a browser UI for Murf.ai text-to-speech.
 - `murf.py` uses the public endpoint behind Murf's no-signup TTS widget. No
   account, API key, cookie, or third-party package is required.
 - `murf_api.py` uses Murf's documented REST API and requires an API key.
-- `app.py` serves a Render-ready web app around `murf.py`.
+- `app.py` serves a web app around `murf.py`, locally or on Vercel.
 
 The two clients are intentionally separate. The keyless path is for zero-setup
 use and the premium voices/controls that the public endpoint happens to honor.
@@ -37,7 +37,8 @@ text. Directory outputs and explicit `.mp3` paths are both supported.
 `app.py` serves a single-page voice lab with searchable voice filters, premium
 badges, style selection, rate and pitch sliders, locale override, pause
 insertion, an audio player, and MP3 download. It uses the keyless `murf.py`
-client, so there is no API key to configure.
+client, so there is no API key to configure. The HTML, CSS, JS, and favicon
+live in `public/`; `api/` contains the Vercel Python functions.
 
 Run it locally:
 
@@ -46,43 +47,62 @@ py -3 app.py
 # open http://127.0.0.1:10000
 ```
 
-The server binds `0.0.0.0` and reads `PORT` from the environment, which is what
-Render expects. `render.yaml` is included as a Render Blueprint. It is pinned
-to the `feat/render-site` branch; change that line if you merge the site into
-`main`.
+The server binds `0.0.0.0` and reads `PORT` from the environment. Set `HOST` or
+pass `--host` / `--port` if the defaults do not fit.
 
-### Deploy on Render
+### Deploy on Vercel
 
-1. Push the branch and open the repo in Render.
-2. Choose **New → Blueprint**, select the repository and the `feat/render-site`
-   branch, and apply `render.yaml`. If the Blueprint picker only offers the
-   default branch, use the manual Web Service option below and select the
-   branch explicitly.
-3. Or create a **Web Service** manually with:
-   - Build command: `pip install -r requirements.txt`
-   - Start command: `python app.py`
-   - Health check path: `/healthz`
+The repository includes `vercel.json`, Python functions in `api/`, and static
+files in `public/`. No build step or third-party package is required.
 
-Render will provide `PORT`; do not hardcode it. The service runs on the free
-plan in the blueprint, so it may sleep when idle.
+1. Push the branch and open the repository in Vercel.
+2. Choose **Add New → Project**, import the repository, and select the
+   `feat/vercel` branch. Use `main` if this branch has been merged.
+3. Leave the framework preset on **Other**. Use the repository root, leave the
+   build command empty, and use `public` as the output directory. `vercel.json`
+   also sets the output directory, function duration, health rewrite, and
+   security headers.
+4. Deploy. Vercel serves `public/` at the site root and builds each file in
+   `api/` as a function at `/api/<name>`.
+5. Open `/healthz` to verify the deployment, then load the page and generate a
+   short clip.
+
+The Hobby plan is enough for this site. The optional Vercel CLI route is:
+
+```powershell
+npx vercel --prod
+```
+
+Vercel's file-function runtime supports the `BaseHTTPRequestHandler`
+subclasses in `api/`. `server/vercel_core.py` supplies the shared application
+and maps each function URL onto the routes in `app.py`.
 
 ### Web environment knobs
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `WEB_MAX_TEXT` | `5000` | Maximum characters accepted by the web form |
+| `WEB_MAX_TEXT` | `5000` local, `2500` on Vercel | Maximum characters accepted by the web form |
 | `WEB_RATE_CHUNKS` | `40` | Audio chunks allowed per client IP per window |
 | `WEB_RATE_WINDOW` | `900` | Rate-limit window in seconds |
-| `WEB_MAX_CONCURRENT` | `2` | Maximum simultaneous Murf requests |
+| `WEB_MAX_CONCURRENT` | `2` | Maximum simultaneous Murf requests per process |
 | `WEB_CHUNK_DELAY` | `0.15` | Delay between chunk requests in seconds |
 | `MURF_BASE_URL` | `https://murf.ai` | Override the endpoint origin, mainly for local mocks |
-| `PORT` | `10000` | Bind port; Render sets this automatically |
+| `PORT` | `10000` | Local bind port; Vercel functions do not use it |
 
 The rate limit counts 500-character chunks, not button clicks. A single
-5,000-character script costs about 10 units. Render's outbound IP may be shared
-with other services, and Murf budgets the public endpoint per IP, so a busy
-deployment can still hit the upstream limit. The page reports that case and
-suggests waiting or using the official client.
+5,000-character script costs about 10 units. The host's outbound IP may be
+shared with other services, and Murf budgets the public endpoint per IP, so a
+busy deployment can still hit the upstream limit. The page reports that case
+and suggests waiting or using the official client.
+
+Vercel limits a function response to 4.5 MB. The default Vercel text cap of
+2,500 characters is roughly five audio chunks and leaves headroom under that
+limit. Raising `WEB_MAX_TEXT` also raises the chance of a truncated response;
+the local server has no such cap.
+
+The Vercel rate limiter is in memory per function instance. It slows a single
+warm instance but is not a global quota; Vercel can start more instances and
+Murf still budgets calls per outbound IP.
 
 ## Voice catalog
 
@@ -107,9 +127,11 @@ as `V016093953653282U4`, or an unambiguous display name. The default voice is
 ```text
 murf.py            keyless public-endpoint client
 murf_api.py        official API-key client
-app.py             Render-ready web server
-web/               HTML, CSS, JS, and favicon for the site
-render.yaml        Render Blueprint
+app.py             local web server and shared application
+public/            HTML, CSS, JS, and favicon served by Vercel
+api/               Vercel Python function routes
+server/            Vercel adapter around app.py
+vercel.json        static output, functions, rewrite, headers
 tests/             local mock-server checks
 ```
 
