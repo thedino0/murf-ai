@@ -18,10 +18,18 @@ if str(ROOT) not in sys.path:
 
 import app as webapp  # noqa: E402
 
-# Vercel caps responses at 4.5 MB. Use 2,500 characters unless the project
-# explicitly sets WEB_MAX_TEXT. The local server keeps its 5,000 default.
-_configured_max_text = os.environ.get("WEB_MAX_TEXT", "").strip()
-application = webapp.Application(max_text=None if _configured_max_text else 2500)
+def _max_text() -> int:
+    """Keep the function under the 4.5 MB response cap by default."""
+    raw = os.environ.get("WEB_MAX_TEXT", "").strip()
+    if not raw:
+        return 2500
+    try:
+        return int(raw)
+    except ValueError:
+        return 2500
+
+
+application = webapp.Application(max_text=_max_text())
 
 
 class ApiHandler(webapp.Handler):
