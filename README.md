@@ -54,7 +54,10 @@ to the `feat/render-site` branch; change that line if you merge the site into
 ### Deploy on Render
 
 1. Push the branch and open the repo in Render.
-2. Choose **New → Blueprint**, select the repository, and apply `render.yaml`.
+2. Choose **New → Blueprint**, select the repository and the `feat/render-site`
+   branch, and apply `render.yaml`. If the Blueprint picker only offers the
+   default branch, use the manual Web Service option below and select the
+   branch explicitly.
 3. Or create a **Web Service** manually with:
    - Build command: `pip install -r requirements.txt`
    - Start command: `python app.py`
