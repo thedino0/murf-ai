@@ -328,8 +328,197 @@ class MurfClient:
             detail=f"matches: {candidates}",
         )
 
+    # -- synthesis ---------------------------------------------------------
+
+    def synthesize(
+        self,
+        text: str,
+        voice_id: str,
+        style: str | None = None,
+        *,
+        rate: int = 0,
+        pitch: int = 0,
+        locale: str | None = None,
+    ) -> bytes:
+        _validate_adjustment("rate", rate)
+        _validate_adjustment("pitch", pitch)
+
+        params: dict[str, str] = {"text": text, "voiceId": voice_id}
+        if style:
+            params["style"] = style
+        if rate:
+            params["rate"] = str(rate)
+        if pitch:
+            params["pitch"] = str(pitch)
+        if locale:
+            params["multiNativeLocale"] = locale.strip().replace("_", "-")
+
+        response = self._request(
+            API_AUDIO,
+            params=params,
+            accept="audio/mpeg,audio/*;q=0.9,*/*;q=0.8",
+        )
+        with response:
+            content_type = response.headers.get("Content-Type", "")
+            try:
+                audio = response.read()
+            except READ_ERRORS as exc:
+                raise MurfError(f"failed to read audio response: {exc}") from exc
+
+        if not audio:
+            raise MurfError("endpoint returned empty audio")
+        looks_like_mp3 = audio.startswith(b"ID3") or (
+            len(audio) > 1 and audio[0] == 0xFF and (audio[1] & 0xE0) == 0xE0
+        )
+        if not looks_like_mp3:
+            detail = _json_message(audio) or audio.decode("utf-8", errors="replace")[:300]
+            raise MurfError(
+                "endpoint returned a non-audio response",
+                detail=detail or f"content-type: {content_type or 'unknown'}",
+            )
+        return audio
+
+
+# -- text splitting --------------------------------------------------------
+
+
+def _cost(text: str) -> int:
+    """UTF-16 code units, the strictest reading of Murf's 500-char limit."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _hard_split(token: str, limit: int) -> list[str]:
+    parts: list[str] = []
+    buffer: list[str] = []
+    size = 0
+    for char in token:
+        char_cost = _cost(char)
+        if buffer and size + char_cost > limit:
+            parts.append("".join(buffer))
+            buffer = [char]
+            size = char_cost
+        else:
+            buffer.append(char)
+            size += char_cost
+    if buffer:
+        parts.append("".join(buffer))
+    return parts
+
+
+def _fit_sentence(sentence: str, limit: int) -> list[str]:
+    if _cost(sentence) <= limit:
+        return [sentence]
+
+    pieces: list[str] = []
+    for word in sentence.split(" "):
+        if not word:
+            continue
+        if _cost(word) <= limit:
+            pieces.append(word)
+        else:
+            pieces.extend(_hard_split(word, limit))
+    return pieces
+
+
+def split_text(text: str, limit: int = MAX_CHUNK_CHARS) -> list[str]:
+    normalized = " ".join(text.split())
+    if not normalized:
+        raise MurfError("text is empty")
+    if _cost(normalized) <= limit:
+        return [normalized]
+
+    chunks: list[str] = []
+    current = ""
+    for sentence in re.split(r"(?<=[.!?…])\s+", normalized):
+        if not sentence:
+            continue
+        for piece in _fit_sentence(sentence, limit):
+            if not current:
+                current = piece
+            elif _cost(current) + 1 + _cost(piece) <= limit:
+                current = f"{current} {piece}"
+            else:
+                chunks.append(current)
+                current = piece
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        if _cost(chunk) > limit:
+            raise MurfError("internal error: chunk exceeds endpoint limit")
+    return chunks
+
+
+# -- audio assembly --------------------------------------------------------
+
+
+def strip_id3(data: bytes) -> bytes:
+    """Remove ID3 tags so MP3 chunks can be concatenated at frame level."""
+    if data[:3] == b"ID3" and len(data) >= 10:
+        size = (
+            ((data[6] & 0x7F) << 21)
+            | ((data[7] & 0x7F) << 14)
+            | ((data[8] & 0x7F) << 7)
+            | (data[9] & 0x7F)
+        )
+        footer = 10 if data[5] & 0x10 else 0
+        data = data[10 + size + footer :]
+    if len(data) >= 128 and data[-128:-125] == b"TAG":
+        data = data[:-128]
+    return data
+
+
+def _atomic_generate(
+    client: MurfClient,
+    text: str,
+    voice: Voice,
+    style: str | None,
+    destination: Path,
+    *,
+    delay: float,
+    quiet: bool,
+    label: str,
+    rate: int = 0,
+    pitch: int = 0,
+    locale: str | None = None,
+) -> tuple[int, int]:
+    chunks = split_text(text)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp = destination.with_name(destination.name + ".part")
+    written = 0
+
+    try:
+        with temp.open("wb") as handle:
+            for index, chunk in enumerate(chunks, 1):
+                _info(
+                    f"{label}chunk {index}/{len(chunks)} ({_cost(chunk)} chars)",
+                    quiet,
+                )
+                audio = client.synthesize(
+                    chunk,
+                    voice.voice_id,
+                    style,
+                    rate=rate,
+                    pitch=pitch,
+                    locale=locale,
+                )
+                payload = audio if index == 1 else strip_id3(audio)
+                if not payload:
+                    raise MurfError("endpoint returned empty audio frames")
+                handle.write(payload)
+                written += len(payload)
+                if index < len(chunks) and delay > 0:
+                    time.sleep(delay)
+        os.replace(temp, destination)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+
+    return written, len(chunks)
+
 
 # -- helpers ---------------------------------------------------------------
+
 
 def _json_message(body: bytes) -> str | None:
     try:
@@ -385,3 +574,152 @@ def _style_names(value: Any) -> tuple[str, ...]:
 
 def _bare_name(name: str) -> str:
     return re.sub(r"\s*\([^)]*\)\s*$", "", name).strip()
+
+
+def _pick_style(voice: Voice, requested: str | None) -> str | None:
+    if requested:
+        return requested
+    lookup = {style.casefold(): style for style in voice.styles}
+    for candidate in ("conversational", "narration"):
+        if candidate in lookup:
+            return lookup[candidate]
+    return voice.styles[0] if voice.styles else None
+
+
+def _voice_dict(voice: Voice) -> dict[str, Any]:
+    return {
+        "voiceId": voice.voice_id,
+        "apiName": voice.api_name,
+        "name": voice.name,
+        "gender": voice.gender,
+        "locale": voice.locale,
+        "language": voice.language,
+        "styles": list(voice.styles),
+        "tier": voice.tier,
+    }
+
+
+def _render_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+
+    def render(row: Sequence[str]) -> str:
+        cells = [cell.ljust(widths[index]) for index, cell in enumerate(row)]
+        return "  ".join(cells).rstrip()
+
+    lines = [render(headers), "  ".join("-" * width for width in widths)]
+    lines.extend(render(row) for row in rows)
+    return "\n".join(lines)
+
+
+def _clip(value: str, width: int) -> str:
+    return value if len(value) <= width else value[: width - 3].rstrip() + "..."
+
+
+def _slugify(text: str, *, limit: int = SLUG_LIMIT) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:limit].rstrip("-") or "speech"
+
+
+def _resolve_output(output: str | None, text: str) -> Path:
+    if not output:
+        return Path.cwd() / f"{_slugify(text)}.mp3"
+
+    path = Path(output).expanduser()
+    if path.is_dir() or output.endswith(("/", "\\")):
+        return path / f"{_slugify(text)}.mp3"
+    if not path.suffix:
+        return path.with_suffix(".mp3")
+    if path.suffix.casefold() != ".mp3":
+        raise MurfError("the free endpoint only produces MP3; use an .mp3 output path")
+    return path
+
+
+def _read_source(text: str | None, file: str | None) -> str:
+    if text and file:
+        raise MurfError("provide either TEXT or --file, not both")
+
+    if file:
+        if file == "-":
+            return sys.stdin.read()
+        try:
+            return Path(file).expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            raise MurfError(f"cannot read {file}: {exc}") from exc
+
+    if text == "-":
+        return sys.stdin.read()
+    if text:
+        return text
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    raise MurfError("provide TEXT, --file, or pipe text through stdin")
+
+
+def _read_batch(path: str) -> list[str]:
+    try:
+        if path == "-":
+            content = sys.stdin.read()
+        else:
+            content = Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError as exc:
+        raise MurfError(f"cannot read {path}: {exc}") from exc
+
+    segments: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        segments.append(stripped)
+    return segments
+
+
+def _validate_text(text: str) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        raise MurfError("text is empty")
+    return cleaned
+
+
+def _voice_id(args: argparse.Namespace) -> str:
+    return args.voice or os.environ.get(ENV_VOICE) or DEFAULT_VOICE
+
+
+def _info(message: str, quiet: bool) -> None:
+    if not quiet:
+        print(message, file=sys.stderr)
+
+
+def _configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+def _non_negative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return number
+
+
+def _adjustment(value: str) -> int:
+    number = int(value)
+    if not ADJUSTMENT_MIN <= number <= ADJUSTMENT_MAX:
+        raise argparse.ArgumentTypeError(
+            f"must be between {ADJUSTMENT_MIN} and {ADJUSTMENT_MAX}"
+        )
+    return number
+
+
+def _non_negative_float(value: str) -> float:
+    number = float(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return number
