@@ -723,3 +723,360 @@ def _non_negative_float(value: str) -> float:
     if number < 0:
         raise argparse.ArgumentTypeError("must be zero or greater")
     return number
+
+
+# -- commands --------------------------------------------------------------
+
+
+def cmd_voices(args: argparse.Namespace, client: MurfClient) -> int:
+    voices = client.voices()
+
+    locale = (args.locale or "").casefold().replace("_", "-")
+    gender = (args.gender or "").casefold()
+    style = (args.style or "").casefold()
+    search = (args.search or "").casefold()
+    tier = (args.tier or "").casefold()
+
+    def matches(voice: Voice) -> bool:
+        if tier and tier != voice.tier.casefold():
+            return False
+        if locale and locale not in voice.locale.casefold().replace("_", "-"):
+            return False
+        if gender and gender != voice.gender.casefold():
+            return False
+        if style and not any(style in item.casefold() for item in voice.styles):
+            return False
+        if search:
+            haystack = " ".join(
+                (
+                    voice.api_name,
+                    voice.name,
+                    voice.locale,
+                    voice.language,
+                    voice.tier,
+                    *voice.styles,
+                )
+            ).casefold()
+            if search not in haystack:
+                return False
+        return True
+
+    voices = [voice for voice in voices if matches(voice)]
+    if args.limit is not None:
+        voices = voices[: args.limit]
+
+    if args.json:
+        json.dump([_voice_dict(voice) for voice in voices], sys.stdout, indent=2, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+
+    if not voices:
+        _info("no voices matched", args.quiet)
+        return 0
+
+    rows = [
+        [
+            voice.tier,
+            voice.voice_id,
+            voice.api_name,
+            _clip(voice.name, 22),
+            voice.gender,
+            voice.locale,
+            _clip(", ".join(voice.styles), 34),
+        ]
+        for voice in voices
+    ]
+    print(
+        _render_table(
+            ["TIER", "VOICE ID", "ALIAS", "NAME", "GENDER", "LOCALE", "STYLES"],
+            rows,
+        )
+    )
+    free = sum(1 for voice in voices if not voice.is_premium)
+    premium = len(voices) - free
+    _info(f"{len(voices)} voice(s): {free} free, {premium} premium", args.quiet)
+    return 0
+
+
+def cmd_speak(args: argparse.Namespace, client: MurfClient) -> int:
+    text = _validate_text(_read_source(args.text, args.file))
+    voice = client.resolve_voice(_voice_id(args))
+    style = _pick_style(voice, args.style)
+    locale = args.locale.strip().replace("_", "-") if args.locale else None
+    destination = _resolve_output(args.output, text)
+
+    written, chunks = _atomic_generate(
+        client,
+        text,
+        voice,
+        style,
+        destination,
+        delay=args.delay,
+        quiet=args.quiet,
+        label="",
+        rate=args.rate,
+        pitch=args.pitch,
+        locale=locale,
+    )
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "path": str(destination),
+                    "bytes": written,
+                    "characters": len(text),
+                    "chunks": chunks,
+                    "voiceId": voice.voice_id,
+                    "voice": voice.label,
+                    "tier": voice.tier,
+                    "style": style,
+                    "rate": args.rate,
+                    "pitch": args.pitch,
+                    "locale": locale,
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        print(destination)
+        _info(f"wrote {written} bytes in {chunks} chunk(s)", args.quiet)
+    return 0
+
+
+def cmd_batch(args: argparse.Namespace, client: MurfClient) -> int:
+    segments = _read_batch(args.input)
+    if not segments:
+        raise MurfError(f"{args.input} contains no text")
+
+    voice = client.resolve_voice(_voice_id(args))
+    style = _pick_style(voice, args.style)
+    locale = args.locale.strip().replace("_", "-") if args.locale else None
+    output_dir = Path(args.output).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    records: list[dict[str, Any]] = []
+    failures: list[tuple[int, str]] = []
+
+    for index, raw in enumerate(segments, 1):
+        try:
+            text = _validate_text(raw)
+        except MurfError as exc:
+            failures.append((index, str(exc)))
+            _info(f"[{index}/{len(segments)}] skipped: {exc}", args.quiet)
+            if args.fail_fast:
+                break
+            continue
+
+        destination = output_dir / f"{args.prefix}-{index:03d}.mp3"
+        _info(f"[{index}/{len(segments)}] {_clip(text, 60)}", args.quiet)
+        try:
+            written, chunks = _atomic_generate(
+                client,
+                text,
+                voice,
+                style,
+                destination,
+                delay=args.delay,
+                quiet=args.quiet,
+                label=f"  [{index}/{len(segments)}] ",
+                rate=args.rate,
+                pitch=args.pitch,
+                locale=locale,
+            )
+            records.append(
+                {
+                    "path": str(destination),
+                    "bytes": written,
+                    "characters": len(text),
+                    "chunks": chunks,
+                    "voiceId": voice.voice_id,
+                    "tier": voice.tier,
+                    "style": style,
+                    "rate": args.rate,
+                    "pitch": args.pitch,
+                    "locale": locale,
+                }
+            )
+        except MurfLimitError as exc:
+            failures.append((index, str(exc)))
+            _info(f"[{index}/{len(segments)}] stopped: {exc}", args.quiet)
+            break
+        except MurfError as exc:
+            failures.append((index, str(exc)))
+            _info(f"[{index}/{len(segments)}] failed: {exc}", args.quiet)
+            if args.fail_fast:
+                break
+
+    if args.json:
+        print(json.dumps(records, indent=2, ensure_ascii=False))
+    else:
+        print(output_dir)
+        _info(
+            f"generated {len(records)} of {len(segments)} segment(s), {len(failures)} failure(s)",
+            args.quiet,
+        )
+
+    return 1 if failures else 0
+
+
+# -- cli -------------------------------------------------------------------
+
+
+def _add_quiet(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+
+
+def _add_voice_controls(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--style", default=None, help="voice style, e.g. Conversational or cheerful")
+    parser.add_argument(
+        "--rate",
+        type=_adjustment,
+        default=0,
+        help="speed adjustment, -50 (slow) to 50 (fast); default 0",
+    )
+    parser.add_argument(
+        "--pitch",
+        type=_adjustment,
+        default=0,
+        help="pitch adjustment, -50 (low) to 50 (high); default 0",
+    )
+    parser.add_argument(
+        "--locale",
+        default=None,
+        help="multilingual locale override, e.g. en-US (sent as multiNativeLocale)",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="murf.py",
+        description="Murf.ai text-to-speech without an API key (free and premium voices)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python murf.py voices --tier premium\n"
+            "  python murf.py voices --locale en-US --gender female\n"
+            "  python murf.py speak \"Hello there.\" --voice en-US-hannah -o hi.mp3\n"
+            "  python murf.py speak \"Wait [pause 2s] for it.\" --rate 10 --pitch -5\n"
+            "  python murf.py speak --file script.txt --voice en-US-natalie --locale en-US\n"
+            "  python murf.py batch lines.txt -o out --prefix clip\n"
+        ),
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get(ENV_BASE_URL, DEFAULT_BASE_URL),
+        help=f"endpoint origin (default: ${ENV_BASE_URL} or {DEFAULT_BASE_URL})",
+    )
+    parser.add_argument("--timeout", type=float, default=90.0, help="request timeout in seconds")
+    parser.add_argument("--retries", type=int, default=4, help="attempts per request (default: 4)")
+    parser.add_argument("-q", "--quiet", action="store_true", help="suppress progress output")
+
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="command")
+
+    voices = subparsers.add_parser("voices", help="list public voices (free + premium)")
+    voices.add_argument(
+        "--tier",
+        type=str.lower,
+        choices=("free", "premium"),
+        help="filter by access tier",
+    )
+    voices.add_argument("--locale", help="filter by locale fragment, e.g. en-US")
+    voices.add_argument("--gender", help="filter by gender")
+    voices.add_argument("--style", help="filter by style fragment")
+    voices.add_argument("--search", help="free-text search over alias, name, locale, style")
+    voices.add_argument("--limit", type=_non_negative_int, default=None, help="show at most N voices")
+    voices.add_argument("--json", action="store_true", help="print raw JSON")
+    voices.set_defaults(handler=cmd_voices)
+    _add_quiet(voices)
+
+    speak = subparsers.add_parser("speak", help="synthesize one piece of text")
+    speak.add_argument("text", nargs="?", help="text to speak; use '-' for stdin")
+    speak.add_argument("--file", help="read text from a UTF-8 file; use '-' for stdin")
+    speak.add_argument(
+        "-v",
+        "--voice",
+        default=None,
+        help=f"voice alias or id (default: {DEFAULT_VOICE} or ${ENV_VOICE})",
+    )
+    speak.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="output .mp3 file, directory, or omitted for a slugged filename",
+    )
+    _add_voice_controls(speak)
+    speak.add_argument(
+        "--delay",
+        type=_non_negative_float,
+        default=0.5,
+        help="seconds between chunk requests (default: 0.5)",
+    )
+    speak.add_argument("--json", action="store_true", help="print generation metadata as JSON")
+    speak.set_defaults(handler=cmd_speak)
+    _add_quiet(speak)
+
+    batch = subparsers.add_parser("batch", help="synthesize one clip per non-empty line")
+    batch.add_argument("input", help="text file with one segment per line; '-' for stdin")
+    batch.add_argument(
+        "-v",
+        "--voice",
+        default=None,
+        help=f"voice alias or id (default: {DEFAULT_VOICE} or ${ENV_VOICE})",
+    )
+    batch.add_argument(
+        "-o",
+        "--output",
+        default="out",
+        help="output directory (default: out)",
+    )
+    batch.add_argument("--prefix", default="speech", help="filename prefix (default: speech)")
+    batch.add_argument(
+        "--delay",
+        type=_non_negative_float,
+        default=0.5,
+        help="seconds between chunk requests (default: 0.5)",
+    )
+    _add_voice_controls(batch)
+    batch.add_argument("--fail-fast", action="store_true", help="stop on the first failure")
+    batch.add_argument("--json", action="store_true", help="print metadata for all clips as JSON")
+    batch.set_defaults(handler=cmd_batch)
+    _add_quiet(batch)
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    _configure_stdio()
+
+    try:
+        retry = RetryPolicy(
+            attempts=max(1, min(args.retries, 10)),
+            timeout=max(1.0, args.timeout),
+        )
+        client = MurfClient(base_url=args.base_url, retry=retry)
+        return args.handler(args, client)
+    except MurfError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        if exc.detail:
+            print(f"detail: {exc.detail}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
