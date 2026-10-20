@@ -1,10 +1,11 @@
 # murf-ai
 
-Python clients for Murf.ai text-to-speech.
+Python clients and a browser UI for Murf.ai text-to-speech.
 
 - `murf.py` uses the public endpoint behind Murf's no-signup TTS widget. No
   account, API key, cookie, or third-party package is required.
 - `murf_api.py` uses Murf's documented REST API and requires an API key.
+- `app.py` serves a Render-ready web app around `murf.py`.
 
 The two clients are intentionally separate. The keyless path is for zero-setup
 use and the premium voices/controls that the public endpoint happens to honor.
@@ -13,7 +14,8 @@ formats other than MP3.
 
 ## Requirements
 
-Python 3.10 or newer. Both clients use only the standard library.
+Python 3.10 or newer. The clients and the web app use only the standard
+library.
 
 On Windows, use `py -3` anywhere the examples show `python`.
 
@@ -29,6 +31,55 @@ py -3 murf.py batch lines.txt -o out --prefix clip
 `speak` accepts text as an argument, from `--file`, or from stdin with `-`.
 If `-o` is omitted, the output name is derived from the first words of the
 text. Directory outputs and explicit `.mp3` paths are both supported.
+
+## Web app
+
+`app.py` serves a single-page voice lab with searchable voice filters, premium
+badges, style selection, rate and pitch sliders, locale override, pause
+insertion, an audio player, and MP3 download. It uses the keyless `murf.py`
+client, so there is no API key to configure.
+
+Run it locally:
+
+```powershell
+py -3 app.py
+# open http://127.0.0.1:10000
+```
+
+The server binds `0.0.0.0` and reads `PORT` from the environment, which is what
+Render expects. `render.yaml` is included as a Render Blueprint. It is pinned
+to the `feat/render-site` branch; change that line if you merge the site into
+`main`.
+
+### Deploy on Render
+
+1. Push the branch and open the repo in Render.
+2. Choose **New → Blueprint**, select the repository, and apply `render.yaml`.
+3. Or create a **Web Service** manually with:
+   - Build command: `pip install -r requirements.txt`
+   - Start command: `python app.py`
+   - Health check path: `/healthz`
+
+Render will provide `PORT`; do not hardcode it. The service runs on the free
+plan in the blueprint, so it may sleep when idle.
+
+### Web environment knobs
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `WEB_MAX_TEXT` | `5000` | Maximum characters accepted by the web form |
+| `WEB_RATE_CHUNKS` | `40` | Audio chunks allowed per client IP per window |
+| `WEB_RATE_WINDOW` | `900` | Rate-limit window in seconds |
+| `WEB_MAX_CONCURRENT` | `2` | Maximum simultaneous Murf requests |
+| `WEB_CHUNK_DELAY` | `0.15` | Delay between chunk requests in seconds |
+| `MURF_BASE_URL` | `https://murf.ai` | Override the endpoint origin, mainly for local mocks |
+| `PORT` | `10000` | Bind port; Render sets this automatically |
+
+The rate limit counts 500-character chunks, not button clicks. A single
+5,000-character script costs about 10 units. Render's outbound IP may be shared
+with other services, and Murf budgets the public endpoint per IP, so a busy
+deployment can still hit the upstream limit. The page reports that case and
+suggests waiting or using the official client.
 
 ## Voice catalog
 
@@ -53,6 +104,9 @@ as `V016093953653282U4`, or an unambiguous display name. The default voice is
 ```text
 murf.py            keyless public-endpoint client
 murf_api.py        official API-key client
+app.py             Render-ready web server
+web/               HTML, CSS, JS, and favicon for the site
+render.yaml        Render Blueprint
 tests/             local mock-server checks
 ```
 
@@ -132,11 +186,13 @@ Keep the key in the environment, not in a tracked file.
 
 ```powershell
 py -3 tests/test_free_client.py
+py -3 tests/test_web.py
 ```
 
-The test starts a local HTTP server and exercises retries, catalog caching,
-free and premium lookup, rate/pitch/locale forwarding, limit handling, and
-chunk sizing. It does not call Murf and does not need a key.
+The checks start local HTTP servers and exercise retries, catalog caching,
+free and premium lookup, rate/pitch/locale forwarding, limit handling, chunk
+sizing, the web API, and the HTML/static responses. They do not call Murf and
+do not need a key.
 
 ## How it works
 
