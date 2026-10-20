@@ -1,0 +1,19 @@
+# generated audio
+*.mp3
+*.wav
+*.flac
+*.part
+out/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+
+# local secrets and environment overrides
+.env
+.env.*
